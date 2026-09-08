@@ -2,114 +2,206 @@
 
 set -euo pipefail
 
-# shellcheck source=/dev/null
 . /etc/transmission/environment-variables.sh
-
 TRANSMISSION_PASSWD_FILE=/config/transmission-credentials.txt
-
-transmission_username=$(head -1 ${TRANSMISSION_PASSWD_FILE})
-transmission_passwd=$(tail -1 ${TRANSMISSION_PASSWD_FILE})
+transmission_username=$(head -1 "${TRANSMISSION_PASSWD_FILE}")
+transmission_passwd=$(tail -1 "${TRANSMISSION_PASSWD_FILE}")
 transmission_settings_file=${TRANSMISSION_HOME}/settings.json
+transmission_auth=""
+new_port="unset"
+last_port="unset"
+current_port="unset"
+double_check="false"
 
-function box_out() {
+log() { echo -e "update-port:\t$1"; }
+
+box_out() {
     local s="$*"
     printf "\033[36m╭─%s─╮\n\033[36m│ \033[34m%s\033[36m │\n\033[36m╰─%s─╯\033[0;39m\n" "${s//?/─}" "$s" "${s//?/─}"
 }
 
+install_package() {
+    if command -v "$1" > /dev/null 2>&1; then
+        #log "Updating $1..."
+        #apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq "$1" >/dev/null 2>&1
+        return 0
+    fi
+    log "$1 not found – installing now..."
+    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq "$1" >/dev/null 2>&1
+    if ! command -v "$1" > /dev/null 2>&1; then
+        log "Failed to install $1! $1 is required to configure ProtonVPN port forwarding."
+        log "Port forwarding for ProtonVPN has not been configured."
+        return 1
+    fi
+    log "$1 has been successfully installed."
+    return 0
+}
+
 open_port() {
-    natpmpc -a 1 0 udp 60 && natpmpc -a 1 0 tcp 60
+    timeout 5 natpmpc -a 1 0 udp 60 > /dev/null 2>&1 && timeout 5 natpmpc -a 1 0 tcp 60
 }
 
 remote() {
-    if test -n "$myauth"; then
-        transmission-remote "$TRANSMISSION_RPC_PORT" --auth "$myauth" --json "$@"
+    if [[ -n "$transmission_auth" ]]; then
+        timeout 5 "$tr_cmd" "$TRANSMISSION_RPC_PORT" --auth "$transmission_auth" --json "$@"
     else
-        transmission-remote "$TRANSMISSION_RPC_PORT" --json "$@"
+        timeout 5 "$tr_cmd" "$TRANSMISSION_RPC_PORT" --json "$@"
     fi
 }
 
-# this function borrowed from openvpn/pia/update-port.sh
-bind_trans() {
-    new_port=$pf_port
-    local transmission_port_check_max_attempts=50
-    local transmission_port_check_attempts=0
-    local transmission_port_check_interval=10
-    #
-    # Now, set port in Transmission
-    #
+# Accepts both the pre-4.1 and JSON-RPC 2.0 response shapes.
+rpc_ok() {
+    jq -e '
+        if has("error") then false
+        elif (.result | type) == "string" then .result == "success"
+        elif (.result | type) == "object" then true
+        else false
+        end
+    ' > /dev/null 2>&1
+}
 
-    # Check if transmission remote is set up with authentication
-    if test "$(jq -r '.["rpc-authentication-required"]' "$transmission_settings_file")" == "true"; then
-        echo "transmission auth required"
-        myauth="$transmission_username:$transmission_passwd"
-    else
-        echo "transmission auth not required"
-        myauth=""
+# Handles arguments/result nesting and peer-port/peer_port spelling.
+session_port() {
+    remote --session-info | jq -r '
+        [.arguments, .result]
+        | map(select(type == "object"))
+        | .[0]
+        | (.peer_port // .["peer-port"]) // empty
+    ' 2>/dev/null || true
+}
+
+bind_trans() {
+    # Ensure Transmission is responsive
+    if ! remote --list | rpc_ok; then
+        return 1
     fi
 
-    # make sure transmission is running and accepting requests
-    echo "waiting for transmission to become responsive"
-    until test "$(remote --list | jq -r .result)" == "success"; do sleep 10; done
-    echo "transmission became responsive"
+    # Set last_port if unset
+    if [[ "$last_port" == "unset" ]]; then
+        last_port="$(session_port)"
+        if ! [[ "$last_port" =~ ^[0-9]+$ && "$last_port" -gt 1024 ]]; then
+            last_port="unset"
+        fi
+    fi
 
-    # get current listening port
-    transmission_peer_port=$(remote --session-info | jq -r '.arguments["peer-port"]')
-    if test "$new_port" -ne "$transmission_peer_port"; then
-        if test "$ENABLE_UFW" == "true"; then
-            echo "Update UFW rules before changing port in Transmission"
+    # Check if port is already bound to Transmission
+    if [[ "$(session_port)" == "$new_port" ]]; then
+        return 0
+    fi
 
-            echo "denying access to $transmission_peer_port"
-            ufw deny "$transmission_peer_port"
+    # Bind port to Transmission
+    if ! remote --port "$new_port" | rpc_ok; then
+        return 1
+    fi
 
-            echo "allowing $new_port through the firewall"
-            ufw allow "$new_port"
+    # Verify that port was bound to Transmission
+    sleep 1
+    if [[ "$(session_port)" == "$new_port" ]]; then
+        return 0
+    fi
+    box_out "Command to change port to $new_port returned success but actually failed!"
+    return 1
+}
+
+set_firewall() {
+    if [[ "${ENABLE_UFW,,}" != "true" ]]; then
+        return 0
+    fi
+
+    # Remove any rules for the old port.
+    if [[ "$last_port" =~ ^[0-9]+$ && "$last_port" -gt 1024 && "$current_port" != "$last_port" ]]; then
+        if timeout 5 ufw status | grep -w "$last_port" | grep -q ALLOW; then
+            log "Removing allow rule for port $last_port"
+            if ! timeout 5 ufw delete allow "$last_port"; then
+                log "Failed while removing allow rule for port $last_port"
+            fi
+        fi
+        if timeout 5 ufw status | grep -w "$last_port" | grep -q DENY; then
+            log "Removing deny rule for port $last_port"
+            if ! timeout 5 ufw delete deny "$last_port"; then
+                log "Failed while removing deny rule for port $last_port"
+            fi
+        fi
+    fi
+
+    # Allow new port
+    if [[ "$current_port" =~ ^[0-9]+$ && "$current_port" -gt 1024 ]]; then
+
+        # A stale deny from an older version would otherwise block this port
+        if timeout 5 ufw status | grep -w "$current_port" | grep -q DENY; then
+            log "Removing stale deny rule for port $current_port"
+            if ! timeout 5 ufw delete deny "$current_port"; then
+                log "Failed while removing deny rule for port $current_port"
+            fi
         fi
 
-        echo "setting transmission port to $new_port"
-        until test "$(remote --port "$new_port" | jq -r .result)" == "success"; do sleep 5; done
-
-        echo "Waiting for port..."
-        until test "$(remote --port-test | jq -r '.arguments["port-is-open"]')" == "true"; do
-            if test $transmission_port_check_attempts -ge $transmission_port_check_max_attempts; then
-                echo "Port check attempts exceeded, giving up..."
-                return 1
-            else
-                printf "Attempt %d of %d. Port is not open yet, waiting %d seconds...\n" $(( transmission_port_check_attempts + 1 )) $transmission_port_check_max_attempts $transmission_port_check_interval
-                ((transmission_port_check_attempts++))
-                sleep $transmission_port_check_interval
+        if ! timeout 5 ufw status | grep -w "$current_port" | grep -q ALLOW; then
+            log "Allowing $current_port through the firewall"
+            if ! timeout 5 ufw allow "$current_port"; then
+                log "Failed while allowing port $current_port"
             fi
-        done
-        echo "Port is open!"
-    else
-        echo "No action needed, port hasn't changed"
+        fi
     fi
 }
 
-if ! which jq; then
-    echo "jq is not installed."
-    exit 1
+update_port() {
+    new_port="$(open_port | sed -nr '1,//s/Mapped public port ([0-9]{4,5}) protocol.*/\1/p')"
+    if [[ "$new_port" =~ ^[0-9]+$ && "$new_port" -gt 1024 ]]; then
+        if [[ "$new_port" != "$current_port" ]]; then
+            if [[ "$double_check" != "true" ]]; then
+                if bind_trans; then
+                    if [[ "$current_port" != "unset" ]]; then
+                        last_port="$current_port"
+                    fi
+                    current_port="$new_port"
+                    double_check="true"
+                    box_out "The forwarded port is: $current_port"
+                else
+                    box_out "Attempt to change port to $new_port failed!"
+                fi
+            else
+                double_check="false"
+            fi
+        else
+            double_check="true"
+        fi
+    else
+        box_out "No valid port returned from natpmpc"
+    fi
+}
+
+log "Waiting for healthcheck to pass before updating ports..."
+while ! /etc/scripts/healthcheck.sh; do
+    log "Not healthy yet. Retrying in 5 seconds..."
+    sleep 5
+    log "Retrying healthcheck..."
+done
+log "Healthcheck passed! Starting port update..."
+
+# Install packages if they are not already installed
+install_package natpmpc || exit 1
+install_package jq || exit 1
+if [[ "${ENABLE_UFW,,}" == "true" ]]; then
+    install_package ufw || exit 1
 fi
 
-if ! which natpmpc; then
-    echo "natpmpc is not installed. natpmpc is required to configure ProtonVPN port forwarding."
-    echo "port forwarding for ProtonVPN has not been configured."
+if [[ "$(jq -r '.["rpc-authentication-required"] // .rpc_authentication_required' "$transmission_settings_file")" == "true" ]]; then
+    transmission_auth="$transmission_username:$transmission_passwd"
+fi
+
+tr_cmd=$(command -v transmission-remote)
+if [[ -z "$tr_cmd" ]]; then
+    log "Error: transmission-remote not found in PATH"
     exit 1
 fi
 
 box_out "ProtonVPN Port Forwarding"
 
-while true; do
-    date
-    pf_port="$(open_port | sed -nr '1,//s/Mapped public port ([0-9]{4,5}) protocol.*/\1/p')"
-    if test "$pf_port" -gt 1024; then
-        if bind_trans; then
-            box_out "The Forwarded Port is: $pf_port"
-        else
-            box_out "The Forwarded Port is: Unavailable"
-        fi
-    else
-        box_out "No Port Retuned from natpmpc"
-    fi
+# Disable exiting on errors to allow the script to keep running even if commands fail
+set +e
 
-    sleep 35
+while true; do
+    update_port
+    set_firewall
+    sleep 45
 done
